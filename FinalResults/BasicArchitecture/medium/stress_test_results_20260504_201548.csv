@@ -1,0 +1,19 @@
+Metric,Value
+Timestamp (UTC),2026-05-04T20:15:48.922257+00:00
+Total Duration (seconds),300.23
+Total Requests,4420
+Requests per Second,14.72
+Min Response Time (ms),6.02
+Max Response Time (ms),60014.74
+Mean Response Time (ms),1154.27
+Median Response Time (ms),29.89
+P95 Response Time (ms),816.81
+P99 Response Time (ms),30843.67
+
+Status Code,Count
+0,12
+200,2957
+400,486
+409,3
+412,820
+500,142

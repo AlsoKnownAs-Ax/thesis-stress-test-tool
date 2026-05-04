@@ -1,0 +1,4 @@
+*.md
+.env
+openapi.json
+results/
