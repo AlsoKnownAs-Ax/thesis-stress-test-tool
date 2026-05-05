@@ -1,0 +1,30 @@
+Metric,Value
+Timestamp (UTC),2026-05-05T12:35:51.969333+00:00
+Total Duration (seconds),299.28
+Total Requests,2784
+Requests per Second,9.30
+Error Rate (%),24.89
+Average Payload Size (bytes),79.93
+Min Response Time (ms),5.38
+Max Response Time (ms),60015.35
+Mean Response Time (ms),7790.48
+Median Response Time (ms),40.21
+P95 Response Time (ms),30682.06
+P99 Response Time (ms),30690.14
+Mean TTFB (ms),n/a
+Median TTFB (ms),n/a
+P95 TTFB (ms),n/a
+P99 TTFB (ms),n/a
+
+Status Code,Count
+0,16
+200,1139
+400,345
+412,607
+500,677
+
+Endpoint,Requests,Error Rate (%),Avg Payload (bytes),Mean (ms),Median (ms),P95 (ms),P99 (ms)
+/api/gateway/order/create,1623,39.49,81.03,12340.11,232.03,30687.60,30691.49
+/api/gateway/order/create (high quantity),716,7.26,82.61,2283.47,9.46,30571.55,30687.84
+/api/gateway/order/create (invalid),345,0.00,47.00,9.15,6.91,10.29,14.15
+/api/gateway/user/create,100,0.00,156.47,225.73,178.33,639.30,862.21
