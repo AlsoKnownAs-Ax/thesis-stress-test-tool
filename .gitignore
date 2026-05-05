@@ -2,3 +2,4 @@
 .env
 openapi.json
 results/
+__pycache__
