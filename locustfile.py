@@ -1,340 +1,407 @@
-from __future__ import annotations
-
 import csv
-import math
-import os
-import random
+import json
+import subprocess
+import sys
 import time
-from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
 
-from locust import between, events, task
-from locust.contrib.fasthttp import FastHttpUser
+from gevent import sleep, spawn_later
+from locust import HttpUser, between, events, task
 
-WORKLOAD_PROFILE = "hard"
+from csv_metrics import CSV_FIELDS, SummaryRecorder, ensure_results_dir, initialize_csv
+from csv_metrics import short_hash, timestamp
+from docker_stats import load_docker_stats_summary
+from settings import (
+	AUTO_DOCKER_STATS,
+	BENCHMARK_VARIANT,
+	BENCHMARK_WORKLOAD,
+	DOCKER_STATS_PATH,
+	DOCKER_STATS_CONTAINERS,
+	DOCKER_STATS_INTERVAL_SECONDS,
+	DOCKER_STATS_START_DELAY_SECONDS,
+	ENDPOINT_STREAM,
+	ENDPOINT_STREAM_NDJSON,
+	ENDPOINT_UNARY,
+	HOST,
+	REQUEST_TIMEOUT_SECONDS,
+	RESULTS_BASE_DIR,
+	SAVE_CUSTOM_CSV,
+	WARMUP_SECONDS,
+	WORKLOADS,
+)
+from workloads import detect_item_count, get_workload_config
 
-BASE_URL = os.getenv("TARGET_HOST", "http://localhost:8000")
-ORDER_CREATE_PATH = "/api/gateway/order/create"
-USER_CREATE_PATH = "/api/gateway/user/create"
-VALID_WORKLOAD_PROFILES = {"easy", "medium", "hard", "all"}
-
-if WORKLOAD_PROFILE not in VALID_WORKLOAD_PROFILES:
-    raise ValueError(
-        f"Invalid WORKLOAD_PROFILE={WORKLOAD_PROFILE!r}. Expected one of: easy, medium, hard, all."
-    )
-
-REQUEST_TIME_SAMPLE_SIZE = 10000
-request_time_samples = []
-response_codes = {}
-request_count = 0
-response_time_sum = 0.0
-min_response_time = float("inf")
-max_response_time = float("-inf")
-start_time = time.time()
-
-
-class GatewayUserBase(FastHttpUser):
-    abstract = True
-    host = BASE_URL
-
-    def on_start(self):
-        self.user_id = self.provision_user()
-        self.order_ids = []
-
-    def build_user_payload(self):
-        unique_suffix = random.randint(100000, 999999)
-        return {
-            "email": f"stress.user.{unique_suffix}@example.com",
-            "first_name": random.choice(["Alex", "Sam", "Jordan", "Taylor"]),
-            "last_name": random.choice(["Lee", "Patel", "Smith", "Garcia"]),
-        }
-
-    def provision_user(self):
-        payload = self.build_user_payload()
-        response = self.client.post(USER_CREATE_PATH, json=payload, name=USER_CREATE_PATH)
-
-        if response.status_code != 200:
-            return None
-
-        try:
-            user_data = response.json()
-        except ValueError:
-            return None
-
-        return user_data.get("id")
-
-    def ensure_user_id(self):
-        if not getattr(self, "user_id", None):
-            self.user_id = self.provision_user()
-        return self.user_id
-
-    def build_order_payload(self, quantity_min=1, quantity_max=10):
-        user_id = self.ensure_user_id()
-        if not user_id:
-            return None
-
-        return {
-            "user_id": user_id,
-            "product_id": str(random.randint(1, 100)),
-            "quantity": random.randint(quantity_min, quantity_max),
-        }
-
-    def send_order(self, payload, request_name=ORDER_CREATE_PATH):
-        with self.client.post(ORDER_CREATE_PATH, json=payload, catch_response=True, name=request_name) as response:
-            if response.status_code in (200, 412):
-                response.success()
-                if response.status_code == 200:
-                    try:
-                        order_data = response.json()
-                        order_id = order_data.get("order_id")
-                        if order_id is not None:
-                            self.order_ids.append(order_id)
-                    except ValueError:
-                        pass
-            else:
-                response.failure(f"Unexpected status {response.status_code}")
-
-    def send_invalid_order(self, payload, request_name):
-        with self.client.post(ORDER_CREATE_PATH, json=payload, catch_response=True, name=request_name) as response:
-            if response.status_code in (400, 422):
-                response.success()
-            else:
-                response.failure(f"Unexpected status for invalid payload: {response.status_code}")
+_summary_recorder = SummaryRecorder()
+_docker_logger_process: Optional[subprocess.Popen] = None
 
 
-def profile_enabled(profile_name):
-    return WORKLOAD_PROFILE in (profile_name, "all")
+def _start_docker_logger() -> None:
+	global _docker_logger_process
+	if not AUTO_DOCKER_STATS or not DOCKER_STATS_PATH:
+		return
+	if _docker_logger_process and _docker_logger_process.poll() is None:
+		return
+	script_path = Path(__file__).with_name("docker_stats_logger.py")
+	command = [
+		sys.executable,
+		str(script_path),
+		"--output",
+		str(DOCKER_STATS_PATH),
+		"--interval",
+		str(DOCKER_STATS_INTERVAL_SECONDS),
+	]
+	if DOCKER_STATS_CONTAINERS.strip():
+		command.extend(["--containers", DOCKER_STATS_CONTAINERS])
+	_docker_logger_process = subprocess.Popen(command)
 
 
-class EasyOrderUser(GatewayUserBase):
-    abstract = not profile_enabled("easy")
-    wait_time = between(2, 5)
-
-    @task(6)
-    def create_order(self):
-        payload = self.build_order_payload()
-        if not payload:
-            return
-
-        self.send_order(payload)
-
-    @task(1)
-    def create_order_with_higher_quantity(self):
-        payload = self.build_order_payload(quantity_min=50, quantity_max=200)
-        if not payload:
-            return
-
-        self.send_order(payload, request_name=f"{ORDER_CREATE_PATH} (high quantity)")
-
-    @task(1)
-    def create_invalid_order(self):
-        payload = {
-            "user_id": "",
-            "product_id": "999",
-            "quantity": -1,
-        }
-
-        self.send_invalid_order(payload, request_name=f"{ORDER_CREATE_PATH} (invalid)")
-
-    @task(1)
-    def refresh_user_record(self):
-        user_id = self.provision_user()
-        if user_id:
-            self.user_id = user_id
-
-
-class MediumOrderUser(GatewayUserBase):
-    abstract = not profile_enabled("medium")
-    wait_time = between(1, 3)
-
-    @task(5)
-    def create_order(self):
-        payload = self.build_order_payload()
-        if not payload:
-            return
-
-        self.send_order(payload)
-
-    @task(2)
-    def create_order_with_higher_quantity(self):
-        payload = self.build_order_payload(quantity_min=50, quantity_max=200)
-        if not payload:
-            return
-
-        self.send_order(payload, request_name=f"{ORDER_CREATE_PATH} (high quantity)")
-
-    @task(1)
-    def create_invalid_order(self):
-        payload = {
-            "user_id": "",
-            "product_id": "999",
-            "quantity": -1,
-        }
-
-        self.send_invalid_order(payload, request_name=f"{ORDER_CREATE_PATH} (invalid)")
-
-    @task(1)
-    def refresh_user_record(self):
-        user_id = self.provision_user()
-        if user_id:
-            self.user_id = user_id
-
-
-class HardOrderUser(GatewayUserBase):
-    abstract = not profile_enabled("hard")
-    wait_time = between(0.5, 1.5)
-
-    @task(4)
-    def rapid_create_orders(self):
-        payload = self.build_order_payload(quantity_min=1, quantity_max=5)
-        if not payload:
-            return
-
-        self.client.post(ORDER_CREATE_PATH, json=payload, name=ORDER_CREATE_PATH)
-
-    @task(2)
-    def create_order(self):
-        payload = self.build_order_payload()
-        if not payload:
-            return
-
-        self.send_order(payload)
-
-    @task(2)
-    def create_order_with_higher_quantity(self):
-        payload = self.build_order_payload(quantity_min=100, quantity_max=300)
-        if not payload:
-            return
-
-        self.send_order(payload, request_name=f"{ORDER_CREATE_PATH} (high quantity)")
-
-    @task(2)
-    def create_invalid_order(self):
-        payload = {
-            "user_id": "",
-            "product_id": "999",
-            "quantity": -1,
-        }
-
-        self.send_invalid_order(payload, request_name=f"{ORDER_CREATE_PATH} (invalid)")
-
-    @task(1)
-    def refresh_user_record(self):
-        user_id = self.provision_user()
-        if user_id:
-            self.user_id = user_id
-
-
-@events.request.add_listener
-def on_request(request_type, name, response_time, response_length, response, context, exception, **kwargs):
-    global request_count, response_time_sum, min_response_time, max_response_time
-
-    request_count += 1
-    response_time_sum += response_time
-    if response_time < min_response_time:
-        min_response_time = response_time
-    if response_time > max_response_time:
-        max_response_time = response_time
-
-    if len(request_time_samples) < REQUEST_TIME_SAMPLE_SIZE:
-        request_time_samples.append(response_time)
-    else:
-        replace_index = random.randint(0, request_count - 1)
-        if replace_index < REQUEST_TIME_SAMPLE_SIZE:
-            request_time_samples[replace_index] = response_time
-
-    code = response.status_code if response is not None else "error"
-    response_codes[code] = response_codes.get(code, 0) + 1
+def _stop_docker_logger() -> None:
+	global _docker_logger_process
+	if not _docker_logger_process:
+		return
+	if _docker_logger_process.poll() is not None:
+		_docker_logger_process = None
+		return
+	_docker_logger_process.terminate()
+	try:
+		_docker_logger_process.wait(timeout=5)
+	except subprocess.TimeoutExpired:
+		_docker_logger_process.kill()
+	_docker_logger_process = None
 
 
 @events.test_start.add_listener
-def on_test_start(environment, **kwargs):
-    global start_time, request_count, response_time_sum, min_response_time, max_response_time
-    request_time_samples.clear()
-    response_codes.clear()
-    request_count = 0
-    response_time_sum = 0.0
-    min_response_time = float("inf")
-    max_response_time = float("-inf")
-    start_time = time.time()
+def _(environment, **kwargs) -> None:
+	initialize_csv(SAVE_CUSTOM_CSV, RESULTS_BASE_DIR, BENCHMARK_WORKLOAD)
+	_warmup_active = WARMUP_SECONDS > 0
+	_summary_recorder.set_warmup_active(_warmup_active)
+	if AUTO_DOCKER_STATS:
+		start_delay = max(DOCKER_STATS_START_DELAY_SECONDS, 0.0)
+		spawn_later(start_delay, _start_docker_logger)
+	if not _warmup_active:
+		return
 
-    print("\n" + "=" * 60)
-    print("Starting Thesis API Gateway stress test")
-    print(f"Target: {BASE_URL}")
-    print(f"Order endpoint: {ORDER_CREATE_PATH}")
-    print(f"User endpoint: {USER_CREATE_PATH}")
-    print("=" * 60 + "\n")
+	def _end_warmup() -> None:
+		sleep(WARMUP_SECONDS)
+		if hasattr(environment, "stats"):
+			environment.stats.reset_all()
+		# End warm-up so custom CSV starts with clean measurements.
+		_summary_recorder.set_warmup_active(False)
+
+	environment.runner.greenlet.spawn(_end_warmup)
 
 
 @events.test_stop.add_listener
-def on_test_stop(environment, **kwargs):
-    if request_count == 0:
-        return
+def _(environment, **kwargs) -> None:
+	if not SAVE_CUSTOM_CSV:
+		return
+	_stop_docker_logger()
+	initialize_csv(SAVE_CUSTOM_CSV, RESULTS_BASE_DIR, BENCHMARK_WORKLOAD)
+	docker_summary = load_docker_stats_summary(DOCKER_STATS_PATH)
+	summary_snapshot = _summary_recorder.snapshot()
+	workload_dir = ensure_results_dir(RESULTS_BASE_DIR, BENCHMARK_WORKLOAD)
+	output_path = workload_dir / (
+		f"{BENCHMARK_WORKLOAD}-{BENCHMARK_VARIANT}-{short_hash()}.csv"
+	)
+	with output_path.open("w", newline="", encoding="utf-8") as handle:
+		writer = csv.DictWriter(handle, fieldnames=CSV_FIELDS)
+		writer.writeheader()
+		for (method, name), stats_entry in environment.stats.entries.items():
+			summary = summary_snapshot.get((method, name))
+			if summary is None:
+				summary = {
+					"endpoint": name,
+					"variant": BENCHMARK_VARIANT,
+					"requests": stats_entry.num_requests,
+					"failures": stats_entry.num_failures,
+					"response_bytes": 0,
+					"expected_items_sum": 0,
+					"received_items_sum": 0,
+					"received_items_count": 0,
+					"received_items_mismatch_count": 0,
+					"time_to_first_item_sum_ms": 0.0,
+					"time_to_first_item_count": 0,
+				}
+			requests = stats_entry.num_requests
+			failures = stats_entry.num_failures
+			error_rate = (failures / requests) if requests else 0.0
+			avg_bytes = summary["response_bytes"] / requests if requests else 0.0
+			received_avg = (
+				summary["received_items_sum"] / summary["received_items_count"]
+				if summary["received_items_count"]
+				else -1
+			)
+			time_to_first_item_avg = (
+				summary["time_to_first_item_sum_ms"]
+				/ summary["time_to_first_item_count"]
+				if summary["time_to_first_item_count"]
+				else ""
+			)
+			writer.writerow(
+				{
+					"timestamp": timestamp(),
+					"workload": BENCHMARK_WORKLOAD,
+					"variant": summary["variant"],
+					"endpoint": summary["endpoint"],
+					"method": method,
+					"requests": requests,
+					"failures": failures,
+					"error_rate": round(error_rate, 6),
+					"avg_response_time_ms": round(stats_entry.avg_response_time, 3),
+					"median_response_time_ms": round(stats_entry.median_response_time, 3),
+					"min_response_time_ms": stats_entry.min_response_time,
+					"max_response_time_ms": stats_entry.max_response_time,
+					"p90_response_time_ms": round(
+						stats_entry.get_response_time_percentile(0.9), 3
+					),
+					"p95_response_time_ms": round(
+						stats_entry.get_response_time_percentile(0.95), 3
+					),
+					"throughput_rps": round(stats_entry.total_rps, 3),
+					"total_response_bytes": summary["response_bytes"],
+					"avg_response_bytes": round(avg_bytes, 3),
+					"expected_items_per_request": WORKLOADS[BENCHMARK_WORKLOAD][
+						"item_count"
+					],
+					"received_items_avg": received_avg,
+					"received_items_mismatch_count": summary[
+						"received_items_mismatch_count"
+					],
+					"time_to_first_item_ms": time_to_first_item_avg,
+					"docker_cpu_avg_percent": docker_summary.get(
+						"cpu_avg_percent", ""
+					),
+					"docker_cpu_max_percent": docker_summary.get(
+						"cpu_max_percent", ""
+					),
+					"docker_mem_avg_mib": docker_summary.get(
+						"mem_avg_mib", ""
+					),
+					"docker_mem_max_mib": docker_summary.get(
+						"mem_max_mib", ""
+					),
+					"docker_net_rx_mib": docker_summary.get("net_rx_mib", ""),
+					"docker_net_tx_mib": docker_summary.get("net_tx_mib", ""),
+					"docker_samples": docker_summary.get("samples", ""),
+				}
+			)
 
-    elapsed = time.time() - start_time
-    sorted_samples = sorted(request_time_samples)
-    sample_count = len(sorted_samples)
-    total_requests = request_count
-    mean_response_time = response_time_sum / total_requests
 
-    if sample_count == 0:
-        median_response_time = 0.0
-        p95_response_time = 0.0
-        p99_response_time = 0.0
-    elif sample_count % 2:
-        median_response_time = sorted_samples[sample_count // 2]
-        p95_index = min(sample_count - 1, max(0, math.ceil(sample_count * 0.95) - 1))
-        p99_index = min(sample_count - 1, max(0, math.ceil(sample_count * 0.99) - 1))
-        p95_response_time = sorted_samples[p95_index]
-        p99_response_time = sorted_samples[p99_index]
-    else:
-        middle = sample_count // 2
-        median_response_time = (sorted_samples[middle - 1] + sorted_samples[middle]) / 2
-        p95_index = min(sample_count - 1, max(0, math.ceil(sample_count * 0.95) - 1))
-        p99_index = min(sample_count - 1, max(0, math.ceil(sample_count * 0.99) - 1))
-        p95_response_time = sorted_samples[p95_index]
-        p99_response_time = sorted_samples[p99_index]
-    requests_per_second = total_requests / elapsed if elapsed > 0 else 0
+class BenchmarkUser(HttpUser):
+	host = HOST
+	wait_time = between(0.1, 0.3)
 
-    print("\n" + "=" * 60)
-    print("Stress test metrics summary")
-    print("=" * 60)
-    print(f"Total duration: {elapsed:.2f} seconds")
-    print(f"Total requests: {total_requests}")
-    print(f"Requests per second: {requests_per_second:.2f}")
-    print("\nResponse time statistics (ms):")
-    print(f"  Min: {min_response_time:.2f}")
-    print(f"  Max: {max_response_time:.2f}")
-    print(f"  Mean: {mean_response_time:.2f}")
-    print(f"  Median: {median_response_time:.2f}")
-    print(f"  P95: {p95_response_time:.2f}")
-    print(f"  P99: {p99_response_time:.2f}")
-    print("\nResponse codes:")
-    for code, count in sorted(response_codes.items(), key=lambda item: str(item[0])):
-        print(f"  {code}: {count}")
-    print("=" * 60 + "\n")
+	def _request(self, endpoint: str, request_name: str, variant: str) -> None:
+		workload = get_workload_config()
+		params = {
+			"itemCount": workload["item_count"],
+			"payloadSizeBytes": workload["payload_size_bytes"],
+		}
 
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    csv_filename = f"stress_test_results_{timestamp}.csv"
-    output_dir = os.path.join("results", WORKLOAD_PROFILE)
-    os.makedirs(output_dir, exist_ok=True)
-    output_path = os.path.join(output_dir, csv_filename)
+		error_message = ""
+		json_parse_success = False
+		received_item_count: Optional[int] = None
+		time_to_first_item_ms: Optional[float] = None
+		start_time = time.perf_counter()
 
-    with open(output_path, "w", newline="", encoding="utf-8") as csvfile:
-        writer = csv.writer(csvfile)
-        writer.writerow(["Metric", "Value"])
-        writer.writerow(["Timestamp (UTC)", datetime.now(timezone.utc).isoformat()])
-        writer.writerow(["Total Duration (seconds)", f"{elapsed:.2f}"])
-        writer.writerow(["Total Requests", total_requests])
-        writer.writerow(["Requests per Second", f"{requests_per_second:.2f}"])
-        writer.writerow(["Min Response Time (ms)", f"{min_response_time:.2f}"])
-        writer.writerow(["Max Response Time (ms)", f"{max_response_time:.2f}"])
-        writer.writerow(["Mean Response Time (ms)", f"{mean_response_time:.2f}"])
-        writer.writerow(["Median Response Time (ms)", f"{median_response_time:.2f}"])
-        writer.writerow(["P95 Response Time (ms)", f"{p95_response_time:.2f}"])
-        writer.writerow(["P99 Response Time (ms)", f"{p99_response_time:.2f}"])
-        writer.writerow([])
-        writer.writerow(["Status Code", "Count"])
-        for code, count in sorted(response_codes.items(), key=lambda item: str(item[0])):
-            writer.writerow([code, count])
+		try:
+			with self.client.get(
+				endpoint,
+				params=params,
+				name=request_name,
+				timeout=REQUEST_TIMEOUT_SECONDS,
+				catch_response=True,
+			) as response:
+				status_code = response.status_code
+				response_size_bytes = len(response.content or b"")
+				success = 200 <= status_code < 300
 
-    print(f"Results saved to: {output_path}")
+				item_count_mismatch = False
+				if success:
+					try:
+						payload = response.json()
+						json_parse_success = True
+						received_item_count = detect_item_count(payload)
+					except Exception as exc:
+						success = False
+						error_message = f"json_parse_error: {exc.__class__.__name__}"
+				else:
+					error_message = f"http_{status_code}"
+
+				expected_item_count = workload["item_count"]
+				if json_parse_success and received_item_count is not None:
+					if received_item_count > 0:
+						time_to_first_item_ms = (
+							time.perf_counter() - start_time
+						) * 1000
+					# Item count mismatches matter for thesis validity, so fail the request.
+					if received_item_count != expected_item_count:
+						item_count_mismatch = True
+						success = False
+						error_message = (
+							f"item_count_mismatch: expected {expected_item_count} "
+							f"got {received_item_count}"
+						)
+
+				if success:
+					response.success()
+				else:
+					response.failure(error_message or "request_failed")
+
+				_summary_recorder.record_summary(
+					SAVE_CUSTOM_CSV,
+					"GET",
+					request_name,
+					endpoint,
+					variant,
+					success,
+					response_size_bytes,
+					expected_item_count,
+					received_item_count,
+					item_count_mismatch,
+					time_to_first_item_ms,
+				)
+		except Exception as exc:
+			error_message = f"exception: {exc.__class__.__name__}"
+			_summary_recorder.record_summary(
+				SAVE_CUSTOM_CSV,
+				"GET",
+				request_name,
+				endpoint,
+				variant,
+				False,
+				0,
+				workload["item_count"],
+				None,
+				False,
+				None,
+			)
+
+	def _request_ndjson(self) -> None:
+		workload = get_workload_config()
+		params = {
+			"itemCount": workload["item_count"],
+			"payloadSizeBytes": workload["payload_size_bytes"],
+		}
+		start_time = time.perf_counter()
+		error_message = ""
+		received_item_count = 0
+		bytes_received = 0
+		item_count_mismatch = False
+		time_to_first_item_ms: Optional[float] = None
+		buffer = b""
+
+		try:
+			with self.client.get(
+				ENDPOINT_STREAM_NDJSON,
+				params=params,
+				name="GET stream_ndjson",
+				timeout=REQUEST_TIMEOUT_SECONDS,
+				stream=True,
+				catch_response=True,
+			) as response:
+				status_code = response.status_code
+				success = 200 <= status_code < 300
+				if not success:
+					error_message = f"http_{status_code}"
+				else:
+					for chunk in response.iter_content(chunk_size=4096):
+						if not chunk:
+							continue
+						bytes_received += len(chunk)
+						buffer += chunk
+						while b"\n" in buffer:
+							line_bytes, buffer = buffer.split(b"\n", 1)
+							line_bytes = line_bytes.rstrip(b"\r")
+							if not line_bytes.strip():
+								continue
+							try:
+								json.loads(line_bytes.decode("utf-8"))
+								received_item_count += 1
+								if time_to_first_item_ms is None:
+									time_to_first_item_ms = (
+										time.perf_counter() - start_time
+									) * 1000
+							except Exception as exc:
+								success = False
+								error_message = (
+									f"json_parse_error: {exc.__class__.__name__}"
+								)
+								break
+						if not success:
+							break
+					if success and buffer.strip():
+						try:
+							json.loads(buffer.decode("utf-8"))
+							received_item_count += 1
+							if time_to_first_item_ms is None:
+								time_to_first_item_ms = (
+									time.perf_counter() - start_time
+								) * 1000
+						except Exception as exc:
+							success = False
+							error_message = (
+								f"json_parse_error: {exc.__class__.__name__}"
+							)
+
+				expected_item_count = workload["item_count"]
+				if success and received_item_count != expected_item_count:
+					item_count_mismatch = True
+					success = False
+					error_message = (
+						f"item_count_mismatch: expected {expected_item_count} "
+						f"got {received_item_count}"
+					)
+
+				if success:
+					response.success()
+				else:
+					response.failure(error_message or "request_failed")
+
+				_summary_recorder.record_summary(
+					SAVE_CUSTOM_CSV,
+					"GET",
+					"GET stream_ndjson",
+					ENDPOINT_STREAM_NDJSON,
+					"stream_ndjson",
+					success,
+					bytes_received,
+					expected_item_count,
+					received_item_count if received_item_count > 0 else None,
+					item_count_mismatch,
+					time_to_first_item_ms,
+				)
+		except Exception as exc:
+			error_message = f"exception: {exc.__class__.__name__}"
+			_summary_recorder.record_summary(
+				SAVE_CUSTOM_CSV,
+				"GET",
+				"GET stream_ndjson",
+				ENDPOINT_STREAM_NDJSON,
+				"stream_ndjson",
+				False,
+				0,
+				workload["item_count"],
+				None,
+				False,
+				None,
+			)
+
+	@task
+	def benchmark(self) -> None:
+		if BENCHMARK_VARIANT == "unary":
+			self._request(ENDPOINT_UNARY, "GET unary", "unary")
+		elif BENCHMARK_VARIANT == "stream":
+			self._request(ENDPOINT_STREAM, "GET stream_aggregated", "stream")
+		elif BENCHMARK_VARIANT == "stream_ndjson":
+			self._request_ndjson()
+		elif BENCHMARK_VARIANT == "mixed":
+			# Mixed tests alternate between unary and aggregated stream.
+			self._request(ENDPOINT_UNARY, "GET unary", "unary")
+			self._request(ENDPOINT_STREAM, "GET stream_aggregated", "stream")
+		else:
+			raise ValueError(
+				f"Unknown BENCHMARK_VARIANT '{BENCHMARK_VARIANT}'. "
+				"Valid options: unary, stream, stream_ndjson, mixed."
+			)
