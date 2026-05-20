@@ -8,9 +8,9 @@ ENDPOINT_STREAM = "/api/gateway/benchmark/stream"
 ENDPOINT_STREAM_NDJSON = "/api/gateway/benchmark/stream-ndjson"
 
 WORKLOADS: Dict[str, Dict[str, int]] = {
-	"easy": {"item_count": 10, "payload_size_bytes": 512},
-	"medium": {"item_count": 100, "payload_size_bytes": 2048},
-	"hard": {"item_count": 1000, "payload_size_bytes": 8192},
+	"easy": {"item_count": 10, "payload_size_bytes": 512}, # 0.0049 MiB
+	"medium": {"item_count": 500, "payload_size_bytes": 4096}, # 1.9531 MiB
+	"hard": {"item_count": 1000, "payload_size_bytes": 4096}, # 3.9062 MiB
 }
 
 BENCHMARK_WORKLOAD = os.getenv("BENCHMARK_WORKLOAD", "easy")

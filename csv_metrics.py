@@ -7,6 +7,7 @@ from typing import Any, Dict, Optional, Tuple
 
 CSV_FIELDS = [
 	"timestamp",
+	"users",
 	"workload",
 	"variant",
 	"endpoint",
@@ -14,7 +15,7 @@ CSV_FIELDS = [
 	"requests",
 	"failures",
 	"error_rate",
-	"avg_response_time_ms",
+	"time_to_first_byte_ms",
 	"median_response_time_ms",
 	"min_response_time_ms",
 	"max_response_time_ms",
@@ -27,6 +28,7 @@ CSV_FIELDS = [
 	"received_items_avg",
 	"received_items_mismatch_count",
 	"time_to_first_item_ms",
+	"total_stream_time_ms",
 	"docker_cpu_avg_percent",
 	"docker_cpu_max_percent",
 	"docker_mem_avg_mib",
@@ -59,6 +61,7 @@ class SummaryRecorder:
 		received_item_count: Optional[int],
 		item_count_mismatch: bool,
 		time_to_first_item_ms: Optional[float],
+		total_stream_time_ms: Optional[float],
 	) -> None:
 		if not save_custom_csv:
 			return
@@ -79,6 +82,8 @@ class SummaryRecorder:
 					"received_items_mismatch_count": 0,
 					"time_to_first_item_sum_ms": 0.0,
 					"time_to_first_item_count": 0,
+					"total_stream_time_sum_ms": 0.0,
+					"total_stream_time_count": 0,
 				},
 			)
 			entry["endpoint"] = endpoint
@@ -96,6 +101,9 @@ class SummaryRecorder:
 			if time_to_first_item_ms is not None:
 				entry["time_to_first_item_sum_ms"] += time_to_first_item_ms
 				entry["time_to_first_item_count"] += 1
+			if total_stream_time_ms is not None:
+				entry["total_stream_time_sum_ms"] += total_stream_time_ms
+				entry["total_stream_time_count"] += 1
 
 	def snapshot(self) -> Dict[Tuple[str, str], Dict[str, Any]]:
 		with self._lock:

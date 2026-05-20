@@ -34,6 +34,7 @@ from workloads import detect_item_count, get_workload_config
 
 _summary_recorder = SummaryRecorder()
 _docker_logger_process: Optional[subprocess.Popen] = None
+_run_user_count: Optional[int] = None
 
 
 def _start_docker_logger() -> None:
@@ -73,7 +74,12 @@ def _stop_docker_logger() -> None:
 
 @events.test_start.add_listener
 def _(environment, **kwargs) -> None:
+	global _run_user_count
 	initialize_csv(SAVE_CUSTOM_CSV, RESULTS_BASE_DIR, BENCHMARK_WORKLOAD)
+	if hasattr(environment, "runner") and environment.runner:
+		_run_user_count = getattr(environment.runner, "target_user_count", None)
+		if _run_user_count is None:
+			_run_user_count = environment.runner.user_count
 	_warmup_active = WARMUP_SECONDS > 0
 	_summary_recorder.set_warmup_active(_warmup_active)
 	if AUTO_DOCKER_STATS:
@@ -107,7 +113,8 @@ def _(environment, **kwargs) -> None:
 	with output_path.open("w", newline="", encoding="utf-8") as handle:
 		writer = csv.DictWriter(handle, fieldnames=CSV_FIELDS)
 		writer.writeheader()
-		for (method, name), stats_entry in environment.stats.entries.items():
+		users = _run_user_count if _run_user_count is not None else ""
+		for (name, method), stats_entry in environment.stats.entries.items():
 			summary = summary_snapshot.get((method, name))
 			if summary is None:
 				summary = {
@@ -122,6 +129,8 @@ def _(environment, **kwargs) -> None:
 					"received_items_mismatch_count": 0,
 					"time_to_first_item_sum_ms": 0.0,
 					"time_to_first_item_count": 0,
+					"total_stream_time_sum_ms": 0.0,
+					"total_stream_time_count": 0,
 				}
 			requests = stats_entry.num_requests
 			failures = stats_entry.num_failures
@@ -138,9 +147,16 @@ def _(environment, **kwargs) -> None:
 				if summary["time_to_first_item_count"]
 				else ""
 			)
+			total_stream_time_avg = (
+				summary["total_stream_time_sum_ms"]
+				/ summary["total_stream_time_count"]
+				if summary["total_stream_time_count"]
+				else ""
+			)
 			writer.writerow(
 				{
 					"timestamp": timestamp(),
+					"users": users,
 					"workload": BENCHMARK_WORKLOAD,
 					"variant": summary["variant"],
 					"endpoint": summary["endpoint"],
@@ -148,7 +164,7 @@ def _(environment, **kwargs) -> None:
 					"requests": requests,
 					"failures": failures,
 					"error_rate": round(error_rate, 6),
-					"avg_response_time_ms": round(stats_entry.avg_response_time, 3),
+					"time_to_first_byte_ms": round(stats_entry.avg_response_time, 3),
 					"median_response_time_ms": round(stats_entry.median_response_time, 3),
 					"min_response_time_ms": stats_entry.min_response_time,
 					"max_response_time_ms": stats_entry.max_response_time,
@@ -169,6 +185,7 @@ def _(environment, **kwargs) -> None:
 						"received_items_mismatch_count"
 					],
 					"time_to_first_item_ms": time_to_first_item_avg,
+					"total_stream_time_ms": total_stream_time_avg,
 					"docker_cpu_avg_percent": docker_summary.get(
 						"cpu_avg_percent", ""
 					),
@@ -186,6 +203,11 @@ def _(environment, **kwargs) -> None:
 					"docker_samples": docker_summary.get("samples", ""),
 				}
 			)
+	if DOCKER_STATS_PATH and DOCKER_STATS_PATH.exists():
+		try:
+			DOCKER_STATS_PATH.unlink()
+		except OSError:
+			pass
 
 
 class BenchmarkUser(HttpUser):
@@ -261,6 +283,7 @@ class BenchmarkUser(HttpUser):
 					received_item_count,
 					item_count_mismatch,
 					time_to_first_item_ms,
+					None,
 				)
 		except Exception as exc:
 			error_message = f"exception: {exc.__class__.__name__}"
@@ -275,6 +298,7 @@ class BenchmarkUser(HttpUser):
 				workload["item_count"],
 				None,
 				False,
+				None,
 				None,
 			)
 
@@ -345,6 +369,7 @@ class BenchmarkUser(HttpUser):
 								f"json_parse_error: {exc.__class__.__name__}"
 							)
 
+					total_stream_time_ms = (time.perf_counter() - start_time) * 1000
 				expected_item_count = workload["item_count"]
 				if success and received_item_count != expected_item_count:
 					item_count_mismatch = True
@@ -371,6 +396,7 @@ class BenchmarkUser(HttpUser):
 					received_item_count if received_item_count > 0 else None,
 					item_count_mismatch,
 					time_to_first_item_ms,
+					total_stream_time_ms,
 				)
 		except Exception as exc:
 			error_message = f"exception: {exc.__class__.__name__}"
@@ -385,6 +411,7 @@ class BenchmarkUser(HttpUser):
 				workload["item_count"],
 				None,
 				False,
+				None,
 				None,
 			)
 
