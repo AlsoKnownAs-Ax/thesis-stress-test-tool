@@ -12,6 +12,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 
+DEFAULT_SUMMARY_PATH = Path("FinalResults/v2.0/workloads_summary.csv")
+TARGET_USERS = [250]
 USER_ORDER = [50, 125, 250]
 WORKLOAD_ORDER = ["easy", "medium", "hard"]
 VARIANT_ORDER = ["unary", "stream", "stream_ndjson"]
@@ -26,28 +28,10 @@ SUM_COLUMNS = {
 
 METRICS = [
     {
-        "column": "median_response_time_ms",
-        "title": "Hard Workload: Median Response Time by Variant and User Load",
-        "ylabel": "Median response time (ms)",
-        "output": "hard_median_response_time.png",
-    },
-    {
-        "column": "p95_response_time_ms",
-        "title": "Hard Workload: P95 Response Time by Variant and User Load",
-        "ylabel": "P95 response time (ms)",
-        "output": "hard_p95_response_time.png",
-    },
-    {
-        "column": "time_to_first_byte_ms",
-        "title": "Hard Workload: Time to First Byte by Variant and User Load",
-        "ylabel": "Time to first byte (ms)",
-        "output": "hard_time_to_first_byte.png",
-    },
-    {
-        "column": "time_to_first_item_ms",
-        "title": "Hard Workload: Time to First Item by Variant and User Load",
-        "ylabel": "Time to first item (ms)",
-        "output": "hard_time_to_first_item.png",
+        "column": "latency_ms",
+        "title": "Hard Workload: Latency by Variant and User Load",
+        "ylabel": "Latency (ms)",
+        "output": "hard_latency.png",
     },
     {
         "column": "throughput_rps",
@@ -56,80 +40,16 @@ METRICS = [
         "output": "hard_throughput.png",
     },
     {
-        "column": "docker_mem_avg_mib",
-        "title": "Hard Workload: Average Docker Memory Usage by Variant and User Load",
-        "ylabel": "Average memory usage (MiB)",
-        "output": "hard_memory_avg.png",
-    },
-    {
         "column": "docker_cpu_avg_percent",
         "title": "Hard Workload: Average Docker CPU Usage by Variant and User Load",
         "ylabel": "Average CPU usage (%)",
         "output": "hard_cpu_avg.png",
     },
     {
-        "column": "error_rate",
-        "title": "Hard Workload: Error Rate by Variant and User Load",
-        "ylabel": "Error rate (%)",
-        "output": "hard_error_rate.png",
-        "skip_if_all_zero": True,
-    },
-    {
-        "column": "avg_response_bytes",
-        "title": "Hard Workload: Average Response Size by Variant and User Load",
-        "ylabel": "Average response size (bytes)",
-        "output": "hard_avg_response_size.png",
-    },
-]
-
-LINE_METRICS = [
-    {
-        "column": "median_response_time_ms",
-        "title": "Hard Workload: Median Response Time Trend by Variant",
-        "ylabel": "Median response time (ms)",
-        "output": "hard_median_response_time_trend.png",
-    },
-    {
-        "column": "p95_response_time_ms",
-        "title": "Hard Workload: P95 Response Time Trend by Variant",
-        "ylabel": "P95 response time (ms)",
-        "output": "hard_p95_response_time_trend.png",
-    },
-    {
-        "column": "time_to_first_byte_ms",
-        "title": "Hard Workload: Time to First Byte Trend by Variant",
-        "ylabel": "Time to first byte (ms)",
-        "output": "hard_time_to_first_byte_trend.png",
-    },
-    {
-        "column": "time_to_first_item_ms",
-        "title": "Hard Workload: Time to First Item Trend by Variant",
-        "ylabel": "Time to first item (ms)",
-        "output": "hard_time_to_first_item_trend.png",
-    },
-    {
-        "column": "throughput_rps",
-        "title": "Hard Workload: Throughput Trend by Variant",
-        "ylabel": "Throughput (requests/sec)",
-        "output": "hard_throughput_trend.png",
-    },
-    {
         "column": "docker_mem_avg_mib",
-        "title": "Hard Workload: Average Docker Memory Usage Trend",
+        "title": "Hard Workload: Average Docker Memory Usage by Variant and User Load",
         "ylabel": "Average memory usage (MiB)",
-        "output": "hard_memory_avg_trend.png",
-    },
-    {
-        "column": "docker_cpu_avg_percent",
-        "title": "Hard Workload: Average Docker CPU Usage Trend",
-        "ylabel": "Average CPU usage (%)",
-        "output": "hard_cpu_avg_trend.png",
-    },
-    {
-        "column": "avg_response_bytes",
-        "title": "Hard Workload: Average Response Size Trend by Variant",
-        "ylabel": "Average response size (bytes)",
-        "output": "hard_avg_response_size_trend.png",
+        "output": "hard_memory_avg.png",
     },
 ]
 
@@ -141,12 +61,12 @@ PAIRWISE_COMPARISONS = [
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Plot hard workload benchmark results from CSV files."
+        description="Plot benchmark results from the consolidated workload summary CSV."
     )
     parser.add_argument(
         "paths",
-        nargs="+",
-        help="Folder containing CSV files or one or more CSV file paths.",
+        nargs="*",
+        help="Optional summary CSV path or folder containing CSV files.",
     )
     return parser.parse_args()
 
@@ -225,7 +145,11 @@ def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
             )
             df = df[df["variant"].isin(VARIANT_ORDER)]
 
-    numeric_columns = [col for col in df.columns if col not in {"timestamp", "workload", "variant", "endpoint", "method"}]
+    numeric_columns = [
+        col
+        for col in df.columns
+        if col not in {"timestamp", "workload", "variant", "endpoint", "method"}
+    ]
     for col in numeric_columns:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
@@ -233,14 +157,27 @@ def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
         df["users"] = pd.to_numeric(df["users"], errors="coerce")
 
     grouped = aggregate_duplicates(df)
+    grouped = grouped[grouped["users"].isin(TARGET_USERS)].copy()
+    grouped["latency_ms"] = grouped.apply(resolve_latency_value, axis=1)
     grouped["workload"] = pd.Categorical(
         grouped["workload"], categories=WORKLOAD_ORDER, ordered=True
     )
-    grouped["users"] = pd.Categorical(grouped["users"], categories=USER_ORDER, ordered=True)
+    grouped["users"] = pd.Categorical(
+        grouped["users"], categories=TARGET_USERS, ordered=True
+    )
     grouped["variant"] = pd.Categorical(grouped["variant"], categories=VARIANT_ORDER, ordered=True)
     grouped = grouped.sort_values(["workload", "users", "variant"])\
         .reset_index(drop=True)
     return grouped
+
+
+def resolve_latency_value(row: pd.Series) -> float:
+    # Use time to first byte as the representative average response time
+    # for unary and regular stream variants. For NDJSON streaming results
+    # the average response time is represented by the total stream time.
+    if row.get("variant") == "stream_ndjson":
+        return row.get("total_stream_time_ms")
+    return row.get("time_to_first_byte_ms")
 
 
 def aggregate_duplicates(df: pd.DataFrame) -> pd.DataFrame:
@@ -276,6 +213,42 @@ def ensure_graphs_dir(root: Path) -> Path:
     return graphs_dir
 
 
+def compute_limits(
+    df: pd.DataFrame,
+    column: str,
+    variants: list[str],
+) -> tuple[float, float] | None:
+    if column not in df.columns:
+        return None
+    values = df.loc[df["variant"].isin(variants), column].dropna()
+    if values.empty:
+        return None
+    lower = float(values.min())
+    upper = float(values.max())
+    if np.isclose(lower, upper):
+        padding = max(abs(lower) * 0.05, 1.0)
+        return lower - padding, upper + padding
+    padding = (upper - lower) * 0.08
+    return lower - padding, upper + padding
+
+
+def annotate_bars(ax: plt.Axes) -> None:
+    for bar in ax.patches:
+        height = bar.get_height()
+        if height is None or pd.isna(height):
+            continue
+        label = f"{height:.1f}"
+        ax.annotate(
+            label,
+            (bar.get_x() + bar.get_width() / 2, height),
+            ha="center",
+            va="bottom",
+            fontsize=8,
+            xytext=(0, 3),
+            textcoords="offset points",
+        )
+
+
 def plot_grouped_bar(
     df: pd.DataFrame,
     metric: dict,
@@ -283,6 +256,7 @@ def plot_grouped_bar(
     variants: list[str],
     suffix: str,
     workload: str,
+    y_limits: tuple[float, float] | None = None,
 ) -> None:
     column = metric["column"]
     if column not in df.columns:
@@ -295,7 +269,7 @@ def plot_grouped_bar(
         return
 
     pivot = df.pivot_table(index="users", columns="variant", values=column, aggfunc="mean")
-    pivot = pivot.reindex(index=USER_ORDER, columns=VARIANT_ORDER)
+    pivot = pivot.reindex(index=TARGET_USERS, columns=VARIANT_ORDER)
 
     variants_to_plot = [v for v in variants if v in pivot.columns and not pivot[v].isna().all()]
     if not variants_to_plot:
@@ -316,55 +290,8 @@ def plot_grouped_bar(
     ax.set_ylabel(metric["ylabel"], fontsize=11)
     ax.set_xticks(x)
     ax.set_xticklabels([str(u) for u in pivot.index], fontsize=10)
-    ax.legend(fontsize=9)
-    ax.grid(axis="y", linestyle="--", alpha=0.6)
-    fig.tight_layout()
-
-    output_path = graphs_dir / with_suffix(metric["output"], suffix)
-    fig.savefig(output_path, dpi=300)
-    plt.close(fig)
-
-
-def plot_line_trend(
-    df: pd.DataFrame,
-    metric: dict,
-    graphs_dir: Path,
-    variants: list[str],
-    suffix: str,
-    workload: str,
-) -> None:
-    column = metric["column"]
-    if column not in df.columns:
-        print(f"Warning: Missing column '{column}'. Skipping line plot.")
-        return
-
-    series = df[column]
-    if series.isna().all():
-        print(f"Warning: Column '{column}' has no data. Skipping line plot.")
-        return
-
-    pivot = df.pivot_table(index="users", columns="variant", values=column, aggfunc="mean")
-    pivot = pivot.reindex(index=USER_ORDER, columns=VARIANT_ORDER)
-
-    variants_to_plot = [v for v in variants if v in pivot.columns and not pivot[v].isna().all()]
-    if not variants_to_plot:
-        print(f"Warning: No data to plot for '{column}'. Skipping line plot.")
-        return
-
-    fig, ax = plt.subplots(figsize=(9, 5.5))
-    for variant in variants_to_plot:
-        ax.plot(
-            pivot.index,
-            pivot[variant].values,
-            marker="o",
-            linewidth=2,
-            label=variant,
-        )
-
-    ax.set_title(build_workload_title(metric["title"], workload), fontsize=12)
-    ax.set_xlabel("User load", fontsize=11)
-    ax.set_ylabel(metric["ylabel"], fontsize=11)
-    ax.set_xticks(USER_ORDER)
+    if y_limits is not None:
+        ax.set_ylim(y_limits)
     ax.legend(fontsize=9)
     ax.grid(axis="y", linestyle="--", alpha=0.6)
     fig.tight_layout()
@@ -380,6 +307,7 @@ def plot_workload_comparison_bar(
     graphs_dir: Path,
     variants: list[str],
     suffix: str,
+    y_limits: tuple[float, float] | None = None,
 ) -> None:
     column = metric["column"]
     if column not in df.columns:
@@ -413,6 +341,9 @@ def plot_workload_comparison_bar(
     ax.set_ylabel(metric["ylabel"], fontsize=11)
     ax.set_xticks(x)
     ax.set_xticklabels([str(w) for w in pivot.index], fontsize=10)
+    if y_limits is not None:
+        ax.set_ylim(y_limits)
+    annotate_bars(ax)
     ax.legend(fontsize=9)
     ax.grid(axis="y", linestyle="--", alpha=0.6)
     fig.tight_layout()
@@ -429,29 +360,17 @@ def summarize_results(df: pd.DataFrame) -> None:
         if workload_df.empty:
             print(f"- {workload}: no data")
             continue
-        for user in USER_ORDER:
+        for user in TARGET_USERS:
             subset = workload_df[workload_df["users"] == user]
             if subset.empty:
                 print(f"- {workload}, {user} users: no data")
                 continue
 
-            unary_vs_stream_median = compare_variants(
-                subset, "median_response_time_ms", "unary", "stream", "min"
+            unary_vs_stream_latency = compare_variants(
+                subset, "latency_ms", "unary", "stream", "min"
             )
-            stream_vs_ndjson_median = compare_variants(
-                subset, "median_response_time_ms", "stream", "stream_ndjson", "min"
-            )
-            unary_vs_stream_p95 = compare_variants(
-                subset, "p95_response_time_ms", "unary", "stream", "min"
-            )
-            stream_vs_ndjson_p95 = compare_variants(
-                subset, "p95_response_time_ms", "stream", "stream_ndjson", "min"
-            )
-            unary_vs_stream_ttf_item = compare_variants(
-                subset, "time_to_first_item_ms", "unary", "stream", "min"
-            )
-            stream_vs_ndjson_ttf_item = compare_variants(
-                subset, "time_to_first_item_ms", "stream", "stream_ndjson", "min"
+            stream_vs_ndjson_latency = compare_variants(
+                subset, "latency_ms", "stream", "stream_ndjson", "min"
             )
             unary_vs_stream_throughput = compare_variants(
                 subset, "throughput_rps", "unary", "stream", "max"
@@ -465,36 +384,16 @@ def summarize_results(df: pd.DataFrame) -> None:
             has_failures = failures is not None and (failures.fillna(0) > 0).any()
             has_error = error_rate is not None and (error_rate.fillna(0) > 0).any()
 
-            expected = subset.get("expected_items_per_request")
-            received = subset.get("received_items_avg")
-            if expected is None or received is None:
-                items_match = "n/a"
-            else:
-                comparison = (expected == received) | (expected.isna() | received.isna())
-                items_match = "Yes" if comparison.all() else "No"
-
-            mismatch_count = subset.get("received_items_mismatch_count")
-            if mismatch_count is None:
-                mismatch_zero = "n/a"
-            else:
-                mismatch_zero = "Yes" if (mismatch_count.fillna(0) == 0).all() else "No"
-
-            median_values = format_variant_values(subset, "median_response_time_ms")
-            median_note = f", median values={median_values}" if median_values else ""
+            latency_values = format_variant_values(subset, "latency_ms")
+            latency_note = f", latency values={latency_values}" if latency_values else ""
 
             print(
                 f"- {workload}, {user} users: "
-                f"median unary vs stream={unary_vs_stream_median}, "
-                f"median stream vs stream_ndjson={stream_vs_ndjson_median}, "
-                f"p95 unary vs stream={unary_vs_stream_p95}, "
-                f"p95 stream vs stream_ndjson={stream_vs_ndjson_p95}, "
-                f"time to first item unary vs stream={unary_vs_stream_ttf_item}, "
-                f"time to first item stream vs stream_ndjson={stream_vs_ndjson_ttf_item}, "
+                f"latency unary vs stream={unary_vs_stream_latency}, "
+                f"latency stream vs stream_ndjson={stream_vs_ndjson_latency}, "
                 f"throughput unary vs stream={unary_vs_stream_throughput}, "
-                f"throughput stream vs stream_ndjson={stream_vs_ndjson_throughput}{median_note}, "
-                f"failures or errors={'Yes' if (has_failures or has_error) else 'No'}, "
-                f"received_items_avg matches expected={items_match}, "
-                f"received_items_mismatch_count is 0={mismatch_zero}"
+                f"throughput stream vs stream_ndjson={stream_vs_ndjson_throughput}{latency_note}, "
+                f"failures or errors={'Yes' if (has_failures or has_error) else 'No'}"
             )
 
 
@@ -583,37 +482,29 @@ def is_all_zero(df: pd.DataFrame, column: str) -> bool:
 
 def main() -> None:
     args = parse_args()
-    csv_files = collect_csv_files(args.paths)
+    input_paths = args.paths or [str(DEFAULT_SUMMARY_PATH)]
+    csv_files = collect_csv_files(input_paths)
     if not csv_files:
         raise SystemExit("No CSV files found to process.")
 
     df = load_csvs(csv_files)
     cleaned = clean_dataframe(df)
 
-    output_csv = Path("hard_workload_summary.csv")
-    cleaned.to_csv(output_csv, index=False)
-
     graphs_dir = ensure_graphs_dir(Path.cwd())
-    for workload in WORKLOAD_ORDER:
-        workload_df = cleaned[cleaned["workload"] == workload]
-        if workload_df.empty:
-            continue
-        for metric in METRICS:
-            if metric.get("skip_if_all_zero") and is_all_zero(workload_df, metric["column"]):
-                print(f"All {workload} workload runs completed with 0% error rate.")
-                continue
-            for left, right, suffix in PAIRWISE_COMPARISONS:
-                plot_grouped_bar(workload_df, metric, graphs_dir, [left, right], suffix, workload)
-        for metric in LINE_METRICS:
-            for left, right, suffix in PAIRWISE_COMPARISONS:
-                plot_line_trend(workload_df, metric, graphs_dir, [left, right], suffix, workload)
-
+    metric_limits = {
+        metric["column"]: compute_limits(cleaned, metric["column"], ["unary", "stream", "stream_ndjson"])
+        for metric in METRICS
+    }
     for metric in METRICS:
-        if metric.get("skip_if_all_zero") and is_all_zero(cleaned, metric["column"]):
-            print("All workload runs completed with 0% error rate.")
-            continue
         for left, right, suffix in PAIRWISE_COMPARISONS:
-            plot_workload_comparison_bar(cleaned, metric, graphs_dir, [left, right], suffix)
+            plot_workload_comparison_bar(
+                cleaned,
+                metric,
+                graphs_dir,
+                [left, right],
+                suffix,
+                metric_limits.get(metric["column"]),
+            )
 
     summarize_results(cleaned)
 
